@@ -1,146 +1,245 @@
-const jwt = require("jsonwebtoken");
-
-const QRPass = require("../models/QRPass");
+const { v4: uuidv4 } = require("uuid");
+const MachineToken = require("../models/MachineToken"); // Ensure this points to your new schema file
 const AccessRequest = require("../models/AccessRequest");
 const ScanLog = require("../models/ScanLog");
 
+const BATCH_SIZE = 50;       // Maximum offline token pool size
+
 /**
- * ✅ Hardware Compatible Endpoint
- * POST /validate
- * Body: { qrData: "..." }
- * Response: { access: true/false }
+ * Generate N tokens for a machine and persist them.
+ * Returns an array of { tokenId } objects to send to the device.
  */
-const validateHardwareQR = async (req, res) => {
-    try {
-        const qrData = req.body?.qrData;
+async function generateAndSaveTokens(machineId, count, batchIndex) {
+  const tokens = Array.from({ length: count }, () => ({
+    machineId,
+    tokenId: uuidv4(),
+    status: "AVAILABLE",
+    batchIndex,
+  }));
+  await MachineToken.insertMany(tokens);
+  return tokens.map((t) => ({ tokenId: t.tokenId }));
+}
 
-        if (!qrData) {
-            return res.status(400).json({
-                access: false,
-                message: "Missing QR Data",
-                state: null,
-            });
-        }
-
-        // ✅ Verify JWT Token
-        let decoded;
-        try {
-            decoded = jwt.verify(qrData, process.env.JWT_SECRET);
-        } catch {
-            return res.status(401).json({
-                access: false,
-                message: "Invalid QR",
-                state: null,
-            });
-        }
-
-        // Map minified keys back to original variables (with fallback for legacy tokens)
-        const { tId, rId, pTy, vU } = decoded;
-        const tokenId = tId || decoded.tokenId;
-        const requestId = rId || decoded.requestId;
-        const passType = pTy !== undefined ? (pTy === 1 ? "IN" : "OUT") : decoded.passType;
-        const validUntil = vU ? new Date(vU * 1000) : decoded.validUntil;
-
-        // ✅ Expiry Check
-        if (new Date() > new Date(validUntil)) {
-            return res.status(401).json({
-                access: false,
-                message: "QR Expired",
-                state: null,
-            });
-        }
-
-        // ✅ QR must exist
-        const qrPass = await QRPass.findOne({ where: { tokenId } });
-        if (!qrPass) {
-            return res.status(401).json({
-                access: false,
-                message: "QR Not Found",
-                state: null,
-            });
-        }
-
-        // ✅ Get User
-        const user = await AccessRequest.findById(requestId);
-        if (!user) {
-            return res.status(401).json({
-                access: false,
-                message: "User Not Found",
-                state: null,
-            });
-        }
-
-        /**
-         * ✅ STATE MACHINE SECURITY
-         */
-        if (passType === "IN") {
-            if (user.currentState !== "OUTSIDE") {
-                return res.status(401).json({
-                    access: false,
-                    message: "Already Inside",
-                    state: user.currentState,
-                });
-            }
-
-            user.currentState = "INSIDE";
-            await user.save();
-
-            await ScanLog.create({
-                tokenId,
-                gateId: "ROOM_ENTRY",
-                result: "ALLOW",
-                reason: "ENTRY_ALLOWED",
-            });
-
-            return res.status(200).json({
-                access: true,
-                message: "Welcome (Entry)",
-                state: user.currentState,
-            });
-        }
-
-        if (passType === "OUT") {
-            if (user.currentState !== "INSIDE") {
-                return res.status(401).json({
-                    access: false,
-                    message: "Already Outside",
-                    state: user.currentState,
-                });
-            }
-
-            user.currentState = "OUTSIDE";
-            await user.save();
-
-            await ScanLog.create({
-                tokenId,
-                gateId: "ROOM_EXIT",
-                result: "ALLOW",
-                reason: "EXIT_ALLOWED",
-            });
-
-            return res.status(200).json({
-                access: true,
-                message: "Goodbye (Exit)",
-                state: user.currentState,
-            });
-        }
-
-        return res.status(401).json({
-            access: false,
-            message: "Invalid Pass Type",
-            state: user.currentState,
-        });
-    } catch (err) {
-        console.log("VALIDATE ERROR:", err);
-
-        return res.status(500).json({
-            access: false,
-            message: "Server Error",
-            error: err.message,
-            state: null,
-        });
-
+/**
+ * GET /api/hardware/tokens/:machineId
+ * Called by hardware device on boot / when token pool is empty.
+ */
+const provisionTokens = async (req, res) => {
+  try {
+    const { machineId } = req.params;
+    if (!machineId) {
+      return res.status(400).json({ success: false, message: "machineId required" });
     }
+
+    // Check existing AVAILABLE tokens
+    const existing = await MachineToken.find({ machineId, status: "AVAILABLE" })
+      .select("tokenId")
+      .lean();
+
+    // If we already have a full pool, don't generate more
+    if (existing.length >= BATCH_SIZE) {
+      console.log(`[HW] Machine ${machineId} already has ${existing.length} available tokens`);
+      return res.json({
+        success: true,
+        machineId,
+        tokenCount: existing.length,
+        tokens: existing.map((t) => ({ tokenId: t.tokenId })),
+      });
+    }
+
+    // Figure out the next batch index for tracking
+    const lastToken = await MachineToken.findOne({ machineId }).sort({ batchIndex: -1 }).lean();
+    const batchIndex = lastToken ? lastToken.batchIndex + 1 : 0;
+
+    // Top up to exactly BATCH_SIZE (50)
+    const needed = BATCH_SIZE - existing.length;
+    const newTokens = await generateAndSaveTokens(machineId, needed, batchIndex);
+    const allTokens = [...existing.map((t) => ({ tokenId: t.tokenId })), ...newTokens];
+
+    console.log(`[HW] Provisioned ${needed} tokens for machine ${machineId} (batch ${batchIndex})`);
+
+    return res.json({
+      success: true,
+      machineId,
+      tokenCount: allTokens.length,
+      tokens: allTokens,
+    });
+  } catch (err) {
+    console.error("[HW] provisionTokens error:", err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
 };
 
-module.exports = { validateHardwareQR };
+/**
+ * POST /api/hardware/sync/:machineId
+ * Called by hardware every 2 minutes to sync used tokens and replenish its pool.
+ */
+const syncBatch = async (req, res) => {
+  try {
+    const { machineId } = req.params;
+    const { usedTokens = [] } = req.body;
+
+    if (!machineId) {
+      return res.status(400).json({ success: false, message: "machineId required" });
+    }
+
+    // Process each used token
+    const logPromises = usedTokens.map(async (entry) => {
+      // Hardware can now send an array of objects to explicitly declare the scanned state
+      const tokenId = typeof entry === "string" ? entry : entry.tokenId;
+      const scannedState = typeof entry === "object" && entry.state ? entry.state : null;
+
+      // 1. Mark token as USED and record exact backend time (ignore hardware timestamps)
+      const token = await MachineToken.findOneAndUpdate(
+        { tokenId, machineId },
+        { 
+          status: "USED", 
+          usedAt: new Date() 
+        },
+        { new: true }
+      );
+
+      if (!token) {
+        console.warn(`[HW] Sync: unknown token ${tokenId} for machine ${machineId}`);
+        return null;
+      }
+
+      // 2. Safely map back to whom it was allocated
+      if (!token.allocatedTo) {
+        console.warn(`[HW] Sync: token ${tokenId} has no allocated user`);
+        return null;
+      }
+
+      const user = await AccessRequest.findById(token.allocatedTo).lean();
+
+      // 3. Generate correct logs. We prioritize the state the hardware physically scanned.
+      if (user) {
+        const finalPassType = scannedState || token.allocatedState || "IN";
+        
+        // Insert the immutable ledger
+        await ScanLog.create({
+          requestId: user._id,
+          tokenId,
+          passType: finalPassType,
+          gateId: machineId,
+          machineId,
+          result: "ALLOW",
+          reason: `Instant/Batch sync from ${machineId}`,
+          createdAt: new Date(), // Strictly use backend timestamp
+        });
+
+        // 4. Update the user's live database state (INSIDE / OUTSIDE)
+        // This flawlessly triggers the Frontend's 3-second smart polling to succeed!
+        await AccessRequest.findByIdAndUpdate(user._id, {
+          currentState: finalPassType === "IN" ? "INSIDE" : "OUTSIDE"
+        });
+      }
+    });
+
+    await Promise.allSettled(logPromises);
+
+    // Generate fresh replacements matching EXACTLY the amount used to maintain the pool of 50
+    const lastToken = await MachineToken.findOne({ machineId }).sort({ batchIndex: -1 }).lean();
+    const batchIndex = lastToken ? lastToken.batchIndex + 1 : 0;
+    
+    // We replace exactly the amount used, rather than a hardcoded REFRESH_SIZE, to ensure pool stays at 50
+    const freshTokens = await generateAndSaveTokens(machineId, usedTokens.length, batchIndex);
+
+    console.log(`[HW] Sync complete for ${machineId}: processed ${usedTokens.length} tokens, issued ${freshTokens.length} fresh`);
+
+    return res.json({
+      success: true,
+      processedCount: usedTokens.length,
+      freshTokens,
+    });
+  } catch (err) {
+    console.error("[HW] syncBatch error:", err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+/**
+ * POST /validate
+ * Real-time / Online fallback validation
+ */
+const validateQR = async (req, res) => {
+  try {
+    const qrData = req.body?.qrData;
+    if (!qrData) {
+      return res.status(400).json({ access: false, message: "Missing QR data" });
+    }
+
+    // Format expected from frontend QR payload: "<tokenId>|<state>|<idNumber>"
+    const parts = qrData.split("|");
+    if (parts.length < 3) {
+      return res.status(400).json({ access: false, message: "Invalid QR format" });
+    }
+    const [tokenId, state, idNumber] = parts;
+
+    // Validate token exists and was assigned to a user (ALLOCATED)
+    const token = await MachineToken.findOne({ tokenId });
+    if (!token) {
+      return res.status(401).json({ access: false, message: "Token not found" });
+    }
+    if (token.status !== "ALLOCATED") {
+      return res.status(401).json({ access: false, message: `Token is ${token.status}` });
+    }
+
+    // Validate user
+    const user = await AccessRequest.findOne({ idNumber });
+    if (!user) {
+      return res.status(401).json({ access: false, message: "User not found" });
+    }
+    if (user.status !== "APPROVED") {
+      return res.status(401).json({ access: false, message: "User not approved" });
+    }
+
+    // Validate access window
+    const now = new Date();
+    if (user.validFrom && now < user.validFrom) {
+      return res.status(401).json({ access: false, message: "Access not yet valid" });
+    }
+    if (user.validUntil && now > user.validUntil) {
+      return res.status(401).json({ access: false, message: "Access expired" });
+    }
+
+    // State machine check
+    if (state === "IN" && user.currentState !== "OUTSIDE") {
+      return res.status(401).json({ access: false, message: "Already inside", state: user.currentState });
+    }
+    if (state === "OUT" && user.currentState !== "INSIDE") {
+      return res.status(401).json({ access: false, message: "Already outside", state: user.currentState });
+    }
+
+    // --- All checks passed: execute state change ---
+    user.currentState = state === "IN" ? "INSIDE" : "OUTSIDE";
+    await user.save();
+
+    // Mark token used immediately on online validation
+    token.status = "USED";
+    token.usedAt = now;
+    await token.save();
+
+    // Log the scan
+    await ScanLog.create({
+      requestId: user._id,
+      tokenId,
+      passType: state,
+      gateId: token.machineId || "UNKNOWN",
+      machineId: token.machineId,
+      result: "ALLOW",
+      reason: "Online real-time validation",
+    });
+
+    return res.json({
+      access: true,
+      message: state === "IN" ? "Welcome — entry allowed" : "Goodbye — exit allowed",
+      state: user.currentState,
+    });
+  } catch (err) {
+    console.error("[HW] validateQR error:", err.message);
+    return res.status(500).json({ access: false, message: "Server error", error: err.message });
+  }
+};
+
+module.exports = { provisionTokens, syncBatch, validateQR };

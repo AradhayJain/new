@@ -35,4 +35,4 @@ const qrPassSchema = new mongoose.Schema(
 // Compound unique index for requestId and passType
 qrPassSchema.index({ requestId: 1, passType: 1 }, { unique: true });
 
-module.exports = mongoose.model("QRPass", qrPassSchema);
+module.exports = mongoose.models.QRPass || mongoose.model("QRPass", qrPassSchema);

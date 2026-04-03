@@ -20,6 +20,11 @@ const scanLogSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    machineId: {
+      type: String,
+      default: null,
+      index: true,
+    },
     result: {
       type: String,
       enum: ["ALLOW", "DENY"],
@@ -35,4 +40,4 @@ const scanLogSchema = new mongoose.Schema(
   }
 );
 
-module.exports = mongoose.model("ScanLog", scanLogSchema);
+module.exports = mongoose.models.ScanLog || mongoose.model("ScanLog", scanLogSchema);

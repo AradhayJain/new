@@ -1,150 +1,142 @@
 const jwt = require("jsonwebtoken");
-const QRPass = require("../models/QRPass");
+const QRPass = require("../models/QRPass"); // Adjust extension if needed
 const ScanLog = require("../models/ScanLog");
+const MachineToken = require("../models/MachineToken");
 const AccessRequest = require("../models/AccessRequest");
 const { updateUserActivity, checkAbusePattern } = require("../services/activityService");
 const { checkRestriction, recordScanAttempt, applyRestriction } = require("../services/qrRotationService");
 
 const verifyQR = async (req, res) => {
   try {
-    // ✅ FIX: req.body can be undefined from hardware requests
     const body = req.body || {};
-    const { qrToken, gateId } = body;
+    const { qrData, qrToken, gateId } = body;
 
-    if (!qrToken || !gateId) {
+    if (!gateId) {
       return res.status(400).json({
         status: "DENY",
-        message: "qrToken and gateId required",
+        message: "gateId required",
         state: null,
       });
     }
 
-    // ✅ Verify JWT
-    let decoded;
-    try {
-      decoded = jwt.verify(qrToken, process.env.JWT_SECRET);
-    } catch (err) {
-      return res.json({
+    let tokenId, state, idNumber, requestId, passType, validFrom, validUntil;
+    let request, token;
+
+    // -------------------------------------------------------------
+    // 1. PARSE PAYLOAD (Handle both New Offline & Old JWT formats)
+    // -------------------------------------------------------------
+    if (qrData) {
+      // NEW FORMAT: "tokenId|state|idNumber"
+      const parts = qrData.split("|");
+      if (parts.length !== 3) {
+        return res.status(400).json({
+          status: "DENY",
+          message: "Invalid QR format",
+          state: null,
+        });
+      }
+      [tokenId, state, idNumber] = parts;
+      passType = state;
+    } else if (qrToken) {
+      // OLD FORMAT: JWT
+      let decoded;
+      try {
+        decoded = jwt.verify(qrToken, process.env.JWT_SECRET);
+      } catch (err) {
+        return res.json({
+          status: "DENY",
+          message: "INVALID_SIGNATURE",
+          state: null,
+        });
+      }
+      const { tId, rId, pTy, vF, vU } = decoded;
+      tokenId = tId || decoded.tokenId;
+      requestId = rId || decoded.requestId;
+      passType = pTy !== undefined ? (pTy === 1 ? "IN" : "OUT") : decoded.passType;
+      validFrom = vF ? new Date(vF * 1000) : decoded.validFrom;
+      validUntil = vU ? new Date(vU * 1000) : decoded.validUntil;
+      
+      if (!tokenId || !requestId || !passType) {
+        return res.json({
+          status: "DENY",
+          message: "INVALID_QR_PAYLOAD",
+          state: null,
+        });
+      }
+    } else {
+      return res.status(400).json({
         status: "DENY",
-        message: "INVALID_SIGNATURE",
+        message: "qrData or qrToken required",
         state: null,
       });
     }
 
-    // Map minified keys back to original variables (with fallback for legacy tokens)
-    const { tId, rId, pTy, vF, vU } = decoded;
-    const tokenId = tId || decoded.tokenId;
-    const requestId = rId || decoded.requestId;
-    const passType = pTy !== undefined ? (pTy === 1 ? "IN" : "OUT") : decoded.passType;
-    const validFrom = vF ? new Date(vF * 1000) : decoded.validFrom;
-    const validUntil = vU ? new Date(vU * 1000) : decoded.validUntil;
-
-    if (!tokenId || !requestId || !passType) {
-      return res.json({
-        status: "DENY",
-        message: "INVALID_QR_PAYLOAD",
-        state: null,
-      });
-    }
-
-    // ✅ Expiry check (JWT) - Check both validFrom and validUntil
     const now = new Date();
 
-    if (validFrom && now < new Date(validFrom)) {
-      await ScanLog.create({
-        requestId,
-        tokenId,
-        passType,
-        gateId,
-        result: "DENY",
-        reason: "QR_NOT_STARTED_YET",
-      });
-
-      return res.json({
-        status: "DENY",
-        message: "QR_NOT_STARTED_YET",
-        state: null,
-      });
+    // -------------------------------------------------------------
+    // 2. VALIDATE TOKEN & FETCH USER
+    // -------------------------------------------------------------
+    if (qrData) {
+      // Validate New Token
+      token = await MachineToken.findOne({ tokenId });
+      
+      // Prevent double scanning or using unassigned tokens
+      if (!token || token.status !== "ALLOCATED") {
+        await ScanLog.create({
+          tokenId,
+          passType: state,
+          gateId,
+          result: "DENY",
+          reason: token ? `TOKEN_IS_${token.status}` : "TOKEN_NOT_FOUND",
+        });
+        return res.json({
+          status: "DENY",
+          message: "TOKEN_NOT_VALID",
+          state: null,
+        });
+      }
+      
+      request = await AccessRequest.findOne({ idNumber });
+      if (!request) return res.json({ status: "DENY", message: "USER_NOT_FOUND", state: null });
+      
+      validFrom = request.validFrom;
+      validUntil = request.validUntil;
+      requestId = request._id;
+      
+    } else {
+      // Validate Old JWT Token
+      const qrPass = await QRPass.findOne({ tokenId, passType });
+      if (!qrPass) {
+        await ScanLog.create({
+          requestId,
+          tokenId,
+          passType,
+          gateId,
+          result: "DENY",
+          reason: "PASS_NOT_FOUND",
+        });
+        return res.json({ status: "DENY", message: "PASS_NOT_FOUND", state: null });
+      }
+      
+      request = await AccessRequest.findById(requestId);
+      if (!request) return res.json({ status: "DENY", message: "USER_NOT_FOUND", state: null });
     }
 
-    if (validUntil && now > new Date(validUntil)) {
-      await ScanLog.create({
-        requestId,
-        tokenId,
-        passType,
-        gateId,
-        result: "DENY",
-        reason: "QR_EXPIRED",
-      });
-
-      return res.json({
-        status: "DENY",
-        message: "QR_EXPIRED",
-        state: null,
-      });
-    }
-
-    // ✅ QRPass must exist
-    const qrPass = await QRPass.findOne({
-      tokenId,
-      passType,
-    });
-
-    if (!qrPass) {
-      await ScanLog.create({
-        requestId,
-        tokenId,
-        passType,
-        gateId,
-        result: "DENY",
-        reason: "PASS_NOT_FOUND",
-      });
-
-      return res.json({
-        status: "DENY",
-        message: "PASS_NOT_FOUND",
-        state: null,
-      });
-    }
-
-    // ✅ Fetch Access Request
-    const request = await AccessRequest.findById(requestId);
-
-    if (!request) {
-      return res.json({
-        status: "DENY",
-        message: "USER_NOT_FOUND",
-        state: null,
-      });
-    }
-
+    // -------------------------------------------------------------
+    // 3. ACCESS RULES & TIMING CHECKS
+    // -------------------------------------------------------------
     if (request.status !== "APPROVED") {
-      return res.json({
-        status: "DENY",
-        message: "NOT_APPROVED",
-        state: request.currentState,
-      });
+      return res.json({ status: "DENY", message: "NOT_APPROVED", state: request.currentState });
     }
 
-    // ✅ NEW: Enforce Validity Start + End (User Selected) - using 'now' from JWT check above
-
-    if (request.validFrom && now < new Date(request.validFrom)) {
-      return res.json({
-        status: "DENY",
-        message: "PASS_NOT_STARTED_YET",
-        state: request.currentState,
-      });
+    if (validFrom && now < new Date(validFrom)) {
+      return res.json({ status: "DENY", message: "PASS_NOT_STARTED_YET", state: request.currentState });
+    }
+    if (validUntil && now > new Date(validUntil)) {
+      return res.json({ status: "DENY", message: "PASS_EXPIRED", state: request.currentState });
     }
 
-    if (request.validUntil && now > new Date(request.validUntil)) {
-      return res.json({
-        status: "DENY",
-        message: "PASS_EXPIRED",
-        state: request.currentState,
-      });
-    }
-
-    // ✅ CHECK FOR RESTRICTIONS (Anti-Abuse)
+    // Restriction checks
     const restrictionCheck = await checkRestriction(requestId);
     if (restrictionCheck.isRestricted) {
       await ScanLog.create({
@@ -155,7 +147,6 @@ const verifyQR = async (req, res) => {
         result: "DENY",
         reason: "USER_RESTRICTED",
       });
-
       return res.json({
         status: "DENY",
         message: "USER_RESTRICTED",
@@ -164,7 +155,7 @@ const verifyQR = async (req, res) => {
       });
     }
 
-    // ✅ RECORD SCAN ATTEMPT
+    // Throttle checks
     const scanAttempt = await recordScanAttempt(requestId);
     if (scanAttempt.shouldRestrict) {
       await ScanLog.create({
@@ -175,59 +166,50 @@ const verifyQR = async (req, res) => {
         result: "DENY",
         reason: "TOO_MANY_ATTEMPTS",
       });
-
-      return res.json({
-        status: "DENY",
-        message: "TOO_MANY_ATTEMPTS",
-        state: request.currentState,
-      });
+      return res.json({ status: "DENY", message: "TOO_MANY_ATTEMPTS", state: request.currentState });
     }
 
-    // ✅ ENTRY
-    if (passType === "IN") {
-      if (request.currentState === "INSIDE") {
-        return res.json({
-          status: "DENY",
-          message: "ALREADY_INSIDE",
-          state: request.currentState,
-        });
-      }
-
-      request.currentState = "INSIDE";
-      await request.save();
+    // State machine check
+    if (passType === "IN" && request.currentState === "INSIDE") {
+      return res.json({ status: "DENY", message: "ALREADY_INSIDE", state: request.currentState });
+    }
+    if (passType === "OUT" && request.currentState === "OUTSIDE") {
+      return res.json({ status: "DENY", message: "ALREADY_OUTSIDE", state: request.currentState });
     }
 
-    // ✅ EXIT
-    if (passType === "OUT") {
-      if (request.currentState === "OUTSIDE") {
-        return res.json({
-          status: "DENY",
-          message: "ALREADY_OUTSIDE",
-          state: request.currentState,
-        });
-      }
+    // -------------------------------------------------------------
+    // 4. EXECUTE ACCESS (Update State, Token, & Logs)
+    // -------------------------------------------------------------
+    
+    // Update Request State
+    request.currentState = passType === "IN" ? "INSIDE" : "OUTSIDE";
+    await request.save();
 
-      request.currentState = "OUTSIDE";
-      await request.save();
+    // Mark MachineToken as USED instantly
+    if (qrData && token) {
+      token.status = "USED";
+      token.usedAt = now;
+      await token.save();
     }
 
-    // ✅ Log scan
+    // Generate accurate log
     await ScanLog.create({
       requestId,
       tokenId,
       passType,
       gateId,
+      machineId: token?.machineId || gateId, 
       result: "ALLOW",
-      reason: null,
+      reason: "Online real-time validation"
     });
 
-    // ✅ UPDATE USER ACTIVITY
+    // -------------------------------------------------------------
+    // 5. POST-SCAN ANALYTICS
+    // -------------------------------------------------------------
     await updateUserActivity(requestId, passType);
-
-    // ✅ CHECK FOR ABUSE PATTERN
     const abuseCheck = await checkAbusePattern(requestId);
     if (abuseCheck.isAbuse) {
-      await applyRestriction(requestId); // No hardcoded duration
+      await applyRestriction(requestId);
     }
 
     return res.json({
@@ -236,9 +218,9 @@ const verifyQR = async (req, res) => {
       state: request.currentState,
       warning: abuseCheck.isAbuse ? "ABUSE_DETECTED" : null,
     });
+    
   } catch (err) {
     console.log("VERIFY ERROR:", err.message);
-
     return res.status(500).json({
       status: "DENY",
       error: err.message,

@@ -12,24 +12,26 @@ app.use(cors({
   origin: "*",
 }));
 
-
 // ✅ Parse JSON properly (ESP32 + Postman + Render safe)
 app.use(express.json({ limit: "1mb" }));
 
 // ✅ Parse urlencoded (extra safety)
 app.use(express.urlencoded({ extended: true }));
 
-
 // Routes
 app.use("/api/user", userRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/gate", gateRoutes);
 
-// ✅ Hardware endpoint
+// ✅ Hardware token provisioning + batch sync
+app.use("/api/hardware", hardwareRoutes);
+
+// ✅ Legacy /validate kept at root for backward compat with existing devices
+app.post("/validate", require("./controllers/hardwareController").validateQR);
+
 app.get("/", (req, res) => {
   res.send("✅ FocusDesk Backend Running");
 });
 
-app.use("/", hardwareRoutes);
-
 module.exports = app;
+

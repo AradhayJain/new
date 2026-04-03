@@ -3,6 +3,7 @@ const router = express.Router();
 
 const {
   submitAccessRequest,
+  getUserRequests,
   getUserQRByIdNumber,
   getMyContributionCalendar,
   getActiveQR,
@@ -10,7 +11,10 @@ const {
   updateMyProfile,
   checkUserProfile,
   setupUserProfile,
-} = require("../controllers/userController");
+  allocateQR,
+  confirmEntry,
+  getAvailableMachines,
+} = require("../controllers/userController.js");
 
 const firebaseAuth = require("../middleware/firebaseAuth");
 
@@ -54,5 +58,27 @@ router.get("/check-profile", firebaseAuth, checkUserProfile);
  * ✅ Setup user profile (after google login)
  */
 router.post("/profile-setup", firebaseAuth, setupUserProfile);
+
+/**
+ * ✅ NEW: Get available machines (No auth needed)
+ */
+router.get("/machines", getAvailableMachines);
+
+/**
+ * ✅ NEW: List user's own requests (by Firebase UID)
+ */
+router.get("/requests", firebaseAuth, getUserRequests);
+
+/**
+ * ✅ NEW: Allocate a pre-seeded machine token as the user's QR pass
+ * Body: { idNumber, machineId }
+ */
+router.post("/allocate-qr", firebaseAuth, allocateQR);
+
+/**
+ * ✅ NEW: Confirm entry/exit after the 20-second post-scan popup
+ * Body: { tokenId, idNumber, enteredSuccessfully, machineId }
+ */
+router.post("/confirm-entry", firebaseAuth, confirmEntry);
 
 module.exports = router;

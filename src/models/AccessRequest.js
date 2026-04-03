@@ -70,10 +70,14 @@ const accessRequestSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    preferredMachineId: {
+      type: String,
+      default: null,
+    },
   },
   {
     timestamps: true, // Adds createdAt and updatedAt
   }
 );
 
-module.exports = mongoose.model("AccessRequest", accessRequestSchema);
+module.exports = mongoose.models.AccessRequest || mongoose.model("AccessRequest", accessRequestSchema);

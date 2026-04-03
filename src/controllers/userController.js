@@ -1,29 +1,23 @@
 const AccessRequest = require("../models/AccessRequest");
 const QRPass = require("../models/QRPass");
 const User = require("../models/User");
+const MachineToken = require("../models/MachineToken");
+const ScanLog = require("../models/ScanLog");
 const { getContributionCalendar } = require("../services/activityService");
 const { getActiveQRType, checkRestriction } = require("../services/qrRotationService");
 const { broadcast } = require("../services/notificationService");
 
 /**
  * ✅ User submits access request (Firebase Protected)
- * Ensures user-selected dates are stored as proper Date objects
  */
 const submitAccessRequest = async (req, res) => {
   try {
     const { fullName, idNumber, organisation, validFrom, validUntil } = req.body;
 
-    // Basic validation
     if (!fullName || !idNumber || !organisation) {
       return res.status(400).json({ message: "All fields are required" });
     }
 
-    // Enforce standard roll format
-    // if (idNumber.includes("/")) {
-    //   return res.status(400).json({ message: "Roll number must not contain '/'" });
-    // }
-
-    // Validity dates check
     if (!validFrom || !validUntil) {
       return res.status(400).json({ message: "Valid From and Valid Until are required" });
     }
@@ -32,7 +26,6 @@ const submitAccessRequest = async (req, res) => {
     const untilDate = new Date(validUntil);
     const now = new Date();
 
-    // Date logic validation
     if (isNaN(fromDate.getTime()) || isNaN(untilDate.getTime())) {
       return res.status(400).json({ message: "Invalid date format" });
     }
@@ -45,7 +38,6 @@ const submitAccessRequest = async (req, res) => {
       return res.status(400).json({ message: "Valid Until cannot be in the past" });
     }
 
-    // Prevent duplicate active requests, but allow re-applying if expired or rejected
     let existing = await AccessRequest.findOne({ idNumber });
 
     if (existing) {
@@ -56,7 +48,6 @@ const submitAccessRequest = async (req, res) => {
         return res.status(409).json({ message: "An active or pending request already exists with this ID number" });
       }
 
-      // If expired or rejected, update the existing request to PENDING with new details
       existing.fullName = fullName;
       existing.organisation = organisation;
       existing.validFrom = fromDate;
@@ -67,25 +58,13 @@ const submitAccessRequest = async (req, res) => {
       if (req.user?.email) existing.firebaseEmail = req.user.email;
 
       await existing.save();
-
-      // Delete old QR passes associated with this request
       await QRPass.deleteMany({ requestId: existing._id });
 
-      // ✅ Broadcast to admins about the renewed request
-      broadcast({ 
-        type: 'NEW_REQUEST', 
-        user: existing.fullName, 
-        rollNo: existing.idNumber 
-      });
+      broadcast({ type: 'NEW_REQUEST', user: existing.fullName, rollNo: existing.idNumber });
 
-      return res.status(201).json({
-        message: "✅ Access request renewed successfully",
-        request: existing,
-      });
+      return res.status(201).json({ message: "✅ Access request renewed successfully", request: existing });
     }
 
-    // ✅ Create request with stored validity window
-    // Firebase auth is optional - users can submit before logging in
     const request = await AccessRequest.create({
       fullName,
       idNumber,
@@ -97,71 +76,42 @@ const submitAccessRequest = async (req, res) => {
       status: "PENDING"
     });
 
-    // ✅ Broadcast to admins about the new request
-    broadcast({ 
-      type: 'NEW_REQUEST', 
-      user: request.fullName, 
-      rollNo: request.idNumber 
-    });
+    broadcast({ type: 'NEW_REQUEST', user: request.fullName, rollNo: request.idNumber });
 
-    return res.status(201).json({
-      message: "✅ Access request submitted successfully",
-      request,
-    });
+    return res.status(201).json({ message: "✅ Access request submitted successfully", request });
   } catch (err) {
     console.error("❌ Error submitAccessRequest:", err.message);
-    return res.status(500).json({
-      message: "Server error",
-      error: err.message,
-    });
+    return res.status(500).json({ message: "Server error", error: err.message });
   }
 };
 
 /**
- * ✅ User fetches BOTH QRs using ID Number
+ * ✅ User fetches BOTH QRs using ID Number (Legacy fallback)
  */
 const getUserQRByIdNumber = async (req, res) => {
   try {
-    // Wildcard route: extract the full roll number (may include slashes like 23/SE/009)
     const idNumber = decodeURIComponent((req.params[0] || req.params.idNumber || "").trim());
-    console.log(`[DEBUG] Fetching QR for ID: ${idNumber}`);
-
-    if (!req.user || !req.user.uid) {
-      console.log(`[DEBUG] No req.user or missing uid`);
-      return res.status(401).json({ message: "Authentication required" });
-    }
+    
+    if (!req.user || !req.user.uid) return res.status(401).json({ message: "Authentication required" });
 
     const request = await AccessRequest.findOne({ idNumber });
+    if (!request) return res.status(404).json({ message: "No request found for this ID number" });
 
-    if (!request) {
-      console.log(`[DEBUG] No AccessRequest found for idNumber: ${idNumber}`);
-      return res.status(404).json({ message: "No request found for this ID number" });
-    }
-
-    // ✅ Link Firebase UID if not already linked
     if (!request.firebaseUid) {
       request.firebaseUid = req.user.uid;
       request.firebaseEmail = req.user.email;
       await request.save();
     }
 
-    // ✅ Check if Firebase UID matches
     if (request.firebaseUid !== req.user.uid) {
-      console.log(`[DEBUG] UID Mismatch! request.firebaseUid=${request.firebaseUid}, req.user.uid=${req.user.uid}`);
       return res.status(403).json({ message: "This ID is registered to another account" });
     }
 
     if (request.status !== "APPROVED") {
-      return res.json({
-        status: request.status,
-        rejectionReason: request.rejectionReason,
-        message: "QR not issued yet. Wait for admin approval.",
-      });
+      return res.json({ status: request.status, rejectionReason: request.rejectionReason, message: "QR not issued yet. Wait for admin approval." });
     }
 
     const passes = await QRPass.find({ requestId: request._id });
-
-    // ✅ Return only the active QR based on currentState
     const activeQRType = request.currentState === "OUTSIDE" ? "IN" : "OUT";
     const activePass = passes.find((p) => p.passType === activeQRType);
 
@@ -175,16 +125,12 @@ const getUserQRByIdNumber = async (req, res) => {
       currentState: request.currentState,
       activeQRType: activeQRType,
       activeQR: activePass,
-      // Still send both for backward compatibility
       entryQR: passes.find((p) => p.passType === "IN"),
       exitQR: passes.find((p) => p.passType === "OUT"),
     });
   } catch (err) {
     console.error("❌ Error getUserQRByIdNumber:", err.message);
-    return res.status(500).json({
-      message: "Server error",
-      error: err.message,
-    });
+    return res.status(500).json({ message: "Server error", error: err.message });
   }
 };
 
@@ -193,29 +139,15 @@ const getUserQRByIdNumber = async (req, res) => {
  */
 const getMyContributionCalendar = async (req, res) => {
   try {
-    // Wildcard route: extract the full roll number (may include slashes like 23/SE/009)
     const idNumber = decodeURIComponent((req.params[0] || req.params.idNumber || "").trim());
-
-    if (!req.user || !req.user.uid) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
+    if (!req.user || !req.user.uid) return res.status(401).json({ message: "Authentication required" });
 
     const request = await AccessRequest.findOne({ idNumber });
+    if (!request) return res.status(404).json({ message: "No request found" });
+    if (request.firebaseUid !== req.user.uid) return res.status(403).json({ message: "Unauthorized access" });
 
-    if (!request) {
-      return res.status(404).json({ message: "No request found" });
-    }
-
-    if (request.firebaseUid !== req.user.uid) {
-      return res.status(403).json({ message: "Unauthorized access" });
-    }
-
-    // Get last 90 days
     const endDate = new Date().toISOString().split("T")[0];
-    const startDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)
-      .toISOString()
-      .split("T")[0];
-
+    const startDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
     const calendar = await getContributionCalendar(request._id.toString(), startDate, endDate);
 
     const totalDays = calendar.length;
@@ -230,54 +162,29 @@ const getMyContributionCalendar = async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("Calendar fetch error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 };
 
 /**
- * ✅ Get active QR type (for dynamic rotation)
+ * ✅ Get active QR type (for dynamic rotation - Legacy)
  */
 const getActiveQR = async (req, res) => {
   try {
-    // Wildcard route: extract the full roll number (may include slashes like 23/SE/009)
     const idNumber = decodeURIComponent((req.params[0] || req.params.idNumber || "").trim());
-
-    if (!req.user || !req.user.uid) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
+    if (!req.user || !req.user.uid) return res.status(401).json({ message: "Authentication required" });
 
     const request = await AccessRequest.findOne({ idNumber });
+    if (!request) return res.status(404).json({ message: "No request found" });
+    if (request.firebaseUid !== req.user.uid) return res.status(403).json({ message: "Unauthorized access" });
+    if (request.status !== "APPROVED") return res.json({ status: request.status, message: "Not approved yet" });
 
-    if (!request) {
-      return res.status(404).json({ message: "No request found" });
-    }
-
-    if (request.firebaseUid !== req.user.uid) {
-      return res.status(403).json({ message: "Unauthorized access" });
-    }
-
-    if (request.status !== "APPROVED") {
-      return res.json({
-        status: request.status,
-        message: "Not approved yet",
-      });
-    }
-
-    // Check for restrictions
     const restrictionCheck = await checkRestriction(request._id.toString());
     if (restrictionCheck.isRestricted) {
-      return res.json({
-        status: "RESTRICTED",
-        message: "Temporarily restricted due to abuse detection",
-        restrictionUntil: restrictionCheck.until,
-      });
+      return res.json({ status: "RESTRICTED", message: "Temporarily restricted", restrictionUntil: restrictionCheck.until });
     }
 
-    // Get active QR type
     const rotation = await getActiveQRType(request._id.toString());
-
-    // Get the appropriate QR pass
     const passes = await QRPass.find({ requestId: request._id });
     const activePass = passes.find((p) => p.passType === rotation.activeQRType);
 
@@ -289,7 +196,6 @@ const getActiveQR = async (req, res) => {
       currentState: request.currentState,
     });
   } catch (err) {
-    console.error("Active QR fetch error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 };
@@ -299,24 +205,13 @@ const getActiveQR = async (req, res) => {
  */
 const getMyProfile = async (req, res) => {
   try {
-    // Wildcard route: extract the full roll number (may include slashes like 23/SE/009)
     const idNumber = decodeURIComponent((req.params[0] || req.params.idNumber || "").trim());
-
-    if (!req.user || !req.user.uid) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
+    if (!req.user || !req.user.uid) return res.status(401).json({ message: "Authentication required" });
 
     const userProfile = await User.findOne({ rollNo: idNumber });
+    if (!userProfile) return res.status(404).json({ message: "Profile not found" });
+    if (userProfile.firebaseUid !== req.user.uid) return res.status(403).json({ message: "Unauthorized access" });
 
-    if (!userProfile) {
-      return res.status(404).json({ message: "Profile not found" });
-    }
-
-    if (userProfile.firebaseUid !== req.user.uid) {
-      return res.status(403).json({ message: "Unauthorized access" });
-    }
-
-    // Fetch the latest access request to attach validity status
     const request = await AccessRequest.findOne({ idNumber }).sort({ createdAt: -1 });
 
     return res.json({
@@ -335,10 +230,10 @@ const getMyProfile = async (req, res) => {
         validFrom: request ? request.validFrom : null,
         validUntil: request ? request.validUntil : null,
         currentState: request ? request.currentState : "OUTSIDE",
+        preferredMachineId: userProfile.preferredMachineId,
       },
     });
   } catch (err) {
-    console.error("Profile fetch error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 };
@@ -348,25 +243,15 @@ const getMyProfile = async (req, res) => {
  */
 const updateMyProfile = async (req, res) => {
   try {
-    // Wildcard route: extract the full roll number (may include slashes like 23/SE/009)
     const idNumber = decodeURIComponent((req.params[0] || req.params.idNumber || "").trim());
     const { department, organisation, fullName, profilePicture, phoneNumber, email, year, bio } = req.body;
 
-    if (!req.user || !req.user.uid) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
+    if (!req.user || !req.user.uid) return res.status(401).json({ message: "Authentication required" });
 
     const userProfile = await User.findOne({ rollNo: idNumber });
+    if (!userProfile) return res.status(404).json({ message: "Profile not found" });
+    if (userProfile.firebaseUid !== req.user.uid) return res.status(403).json({ message: "Unauthorized access" });
 
-    if (!userProfile) {
-      return res.status(404).json({ message: "Profile not found" });
-    }
-
-    if (userProfile.firebaseUid !== req.user.uid) {
-      return res.status(403).json({ message: "Unauthorized access" });
-    }
-
-    // Update allowed fields
     if (department !== undefined) userProfile.designation = department;
     if (organisation !== undefined) userProfile.organisation = organisation;
     if (fullName !== undefined) userProfile.fullName = fullName;
@@ -390,7 +275,6 @@ const updateMyProfile = async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("Profile update error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 };
@@ -400,9 +284,7 @@ const updateMyProfile = async (req, res) => {
  */
 const checkUserProfile = async (req, res) => {
   try {
-    if (!req.user || (!req.user.email && !req.user.uid)) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
+    if (!req.user || (!req.user.email && !req.user.uid)) return res.status(401).json({ message: "Authentication required" });
 
     const query = [];
     if (req.user.email) query.push({ firebaseEmail: req.user.email });
@@ -411,20 +293,20 @@ const checkUserProfile = async (req, res) => {
     const existing = await User.findOne({ $or: query }).sort({ createdAt: -1 });
 
     if (existing) {
-      return res.json({
-        exists: true,
-        data: {
-          fullName: existing.fullName,
-          rollNo: existing.rollNo,
-          organisation: existing.organisation,
-          designation: existing.designation
-        }
+      return res.json({ 
+        exists: true, 
+        data: { 
+          fullName: existing.fullName, 
+          rollNo: existing.rollNo, 
+          organisation: existing.organisation, 
+          designation: existing.designation,
+          preferredMachineId: existing.preferredMachineId 
+        } 
       });
     }
 
     return res.json({ exists: false });
   } catch (err) {
-    console.error("Check profile error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 };
@@ -434,21 +316,13 @@ const checkUserProfile = async (req, res) => {
  */
 const setupUserProfile = async (req, res) => {
   try {
-    if (!req.user || (!req.user.email && !req.user.uid)) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
+    if (!req.user || (!req.user.email && !req.user.uid)) return res.status(401).json({ message: "Authentication required" });
 
-    const { fullName, organisation, designation, rollNo, email } = req.body;
-
-    if (!fullName || !organisation || !designation || !rollNo) {
-      return res.status(400).json({ message: "All fields are required" });
-    }
+    const { fullName, organisation, designation, rollNo, email, preferredMachineId } = req.body;
+    if (!fullName || !organisation || !designation || !rollNo) return res.status(400).json({ message: "All fields are required" });
 
     const firebaseEmail = req.user.email || email;
-
-    if (!firebaseEmail) {
-      return res.status(400).json({ message: "Firebase Email could not be resolved" });
-    }
+    if (!firebaseEmail) return res.status(400).json({ message: "Firebase Email could not be resolved" });
 
     const query = [];
     if (firebaseEmail) query.push({ firebaseEmail: firebaseEmail });
@@ -461,27 +335,176 @@ const setupUserProfile = async (req, res) => {
       user.organisation = organisation;
       user.designation = designation;
       user.rollNo = rollNo;
+      if (preferredMachineId) user.preferredMachineId = preferredMachineId;
       await user.save();
     } else {
-      user = await User.create({
-        firebaseUid: req.user.uid,
-        firebaseEmail: firebaseEmail,
-        fullName,
-        organisation,
-        designation,
+      user = await User.create({ 
+        firebaseUid: req.user.uid, 
+        firebaseEmail: firebaseEmail, 
+        fullName, 
+        organisation, 
+        designation, 
         rollNo,
+        preferredMachineId 
       });
     }
 
     return res.status(200).json({ message: "Profile saved successfully", user });
   } catch (err) {
-    console.error("Setup profile error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+/**
+ * ✅ NEW: Get available machines for dropdown
+ */
+const getAvailableMachines = async (req, res) => {
+  try {
+    const machines = await MachineToken.distinct("machineId");
+    // Provide fallback options if the database has not seen any machines yet
+    const available = machines.length > 0 ? machines : ["GATE_A_MAIN", "GATE_B_MAIN"];
+    return res.json({ success: true, machines: available });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+const getUserRequests = async (req, res) => {
+  try {
+    if (!req.user || !req.user.uid) return res.status(401).json({ message: "Authentication required" });
+
+    const requests = await AccessRequest.find({ firebaseUid: req.user.uid })
+      .sort({ createdAt: -1 })
+      .select('fullName idNumber organisation status validFrom validUntil currentState rejectionReason createdAt updatedAt');
+
+    return res.json({ success: true, requests, count: requests.length });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+/**
+ * ==========================================
+ * 🔥 NEW: PRE-ALLOCATED TOKEN FLOW METHODS 🔥
+ * ==========================================
+ */
+
+/**
+ * ✅ POST /api/user/allocate-qr
+ * Allocates a single AVAILABLE token from the gate's pool to the user.
+ */
+const allocateQR = async (req, res) => {
+  try {
+    if (!req.user || !req.user.uid) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
+
+    const { idNumber, machineId } = req.body;
+    
+    if (!idNumber || !machineId) {
+      return res.status(400).json({ message: "idNumber and machineId are required" });
+    }
+
+    // 1. Verify User Access Request
+    const request = await AccessRequest.findOne({ idNumber });
+    if (!request) return res.status(404).json({ message: "No access request found" });
+    if (request.firebaseUid && request.firebaseUid !== req.user.uid) return res.status(403).json({ message: "Unauthorized" });
+    if (request.status !== "APPROVED") return res.status(403).json({ message: "Access not approved yet" });
+
+    // 2. Validate Time Windows
+    const now = new Date();
+    if (request.validFrom && now < new Date(request.validFrom)) return res.status(403).json({ message: "Access period has not started yet" });
+    if (request.validUntil && now > new Date(request.validUntil)) return res.status(403).json({ message: "Access period has expired" });
+
+    // 3. Determine Required Pass Type (Entering or Exiting)
+    const qrState = request.currentState === "OUTSIDE" ? "IN" : "OUT";
+
+    // 4. Cleanup: Free any stale tokens this user requested earlier but never scanned
+    await MachineToken.updateMany(
+      { allocatedTo: request._id, status: "ALLOCATED" },
+      { status: "AVAILABLE", allocatedTo: null, allocatedState: null, allocatedAt: null }
+    );
+
+    // 5. ATOMIC ALLOCATION: Safely grab 1 available token for this specific machine
+    const token = await MachineToken.findOneAndUpdate(
+      { machineId, status: "AVAILABLE" },
+      { 
+        status: "ALLOCATED", 
+        allocatedTo: request._id,
+        allocatedState: qrState, 
+        allocatedAt: now 
+      },
+      { new: true } // Return the freshly updated document
+    );
+
+    if (!token) {
+      return res.status(503).json({ message: "Gate is currently out of tokens. Please wait a few seconds for hardware sync." });
+    }
+
+    // 6. Format the secure payload for the QR string
+    const qrData = `${token.tokenId}|${qrState}|${idNumber}`;
+
+    console.log(`[QR] Allocated token ${token.tokenId} (${qrState}) to user ${idNumber} on machine ${machineId}`);
+
+    return res.json({
+      success: true,
+      tokenId: token.tokenId,
+      qrData,
+      passType: qrState, // Kept to match frontend expectation
+      currentState: request.currentState,
+      machineId,
+    });
+  } catch (err) {
+    console.error("[QR] allocateQR error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+/**
+ * ✅ POST /api/user/confirm-entry
+ * Called 20s after QR is shown. Solely updates the user's software state machine.
+ * Note: Hardware offline sync generates the actual trusted ScanLog.
+ */
+const confirmEntry = async (req, res) => {
+  try {
+    if (!req.user || !req.user.uid) {
+      return res.status(401).json({ message: "Authentication required" });
+    }
+
+    const { idNumber, enteredSuccessfully } = req.body;
+    
+    if (!idNumber || enteredSuccessfully === undefined) {
+      return res.status(400).json({ message: "idNumber and enteredSuccessfully are required" });
+    }
+
+    const request = await AccessRequest.findOne({ idNumber });
+    if (!request) return res.status(404).json({ message: "No access request found" });
+    if (request.firebaseUid && request.firebaseUid !== req.user.uid) return res.status(403).json({ message: "Unauthorized" });
+
+    // Only change state if they successfully passed through the gate
+    if (enteredSuccessfully) {
+      request.currentState = request.currentState === "OUTSIDE" ? "INSIDE" : "OUTSIDE";
+      await request.save();
+      console.log(`[QR] User ${idNumber} confirmed entry. State updated to: ${request.currentState}`);
+    }
+
+    return res.json({
+      success: true,
+      enteredSuccessfully,
+      currentState: request.currentState,
+      message: enteredSuccessfully 
+        ? `Location state updated successfully.` 
+        : `Location state unchanged.`
+    });
+  } catch (err) {
+    console.error("[QR] confirmEntry error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 };
 
 module.exports = {
   submitAccessRequest,
+  getUserRequests,
   getUserQRByIdNumber,
   getMyContributionCalendar,
   getActiveQR,
@@ -489,4 +512,7 @@ module.exports = {
   updateMyProfile,
   checkUserProfile,
   setupUserProfile,
+  allocateQR,
+  confirmEntry,
+  getAvailableMachines,
 };
