@@ -14,6 +14,7 @@ const {
   allocateQR,
   confirmEntry,
   getAvailableMachines,
+  checkRollNoAvailability,
 } = require("../controllers/userController.js");
 
 const firebaseAuth = require("../middleware/firebaseAuth");
@@ -63,6 +64,11 @@ router.post("/profile-setup", firebaseAuth, setupUserProfile);
  * ✅ NEW: Get available machines (No auth needed)
  */
 router.get("/machines", getAvailableMachines);
+
+/**
+ * ✅ NEW: Check roll number availability
+ */
+router.get("/check-rollno/:rollNo", checkRollNoAvailability);
 
 /**
  * ✅ NEW: List user's own requests (by Firebase UID)

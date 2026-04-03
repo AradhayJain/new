@@ -328,6 +328,18 @@ const setupUserProfile = async (req, res) => {
     if (firebaseEmail) query.push({ firebaseEmail: firebaseEmail });
     if (req.user.uid) query.push({ firebaseUid: req.user.uid });
 
+    // 1. Check if the provided rollNo is already taken by another user
+    const duplicateRollNo = await User.findOne({ 
+      rollNo: { $regex: new RegExp(`^${rollNo}$`, "i") }, // Case-insensitive check
+      firebaseUid: { $ne: req.user.uid } 
+    });
+
+    if (duplicateRollNo) {
+      return res.status(409).json({ 
+        message: `The ID Number "${rollNo}" is already registered to another account. Please contact support if you think this is an error.` 
+      });
+    }
+
     let user = await User.findOne({ $or: query });
 
     if (user) {
@@ -350,6 +362,27 @@ const setupUserProfile = async (req, res) => {
     }
 
     return res.status(200).json({ message: "Profile saved successfully", user });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+/**
+ * ✅ NEW: Check if a Roll Number is already taken
+ */
+const checkRollNoAvailability = async (req, res) => {
+  try {
+    const { rollNo } = req.params;
+    const { uid } = req.query; // Optional: current user's UID to exclude them from the check
+
+    if (!rollNo) return res.status(400).json({ message: "Roll Number required" });
+
+    const existing = await User.findOne({ 
+      rollNo: { $regex: new RegExp(`^${rollNo}$`, "i") },
+      firebaseUid: { $ne: uid }
+    });
+
+    return res.json({ available: !existing });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -515,4 +548,5 @@ module.exports = {
   allocateQR,
   confirmEntry,
   getAvailableMachines,
+  checkRollNoAvailability,
 };
