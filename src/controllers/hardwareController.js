@@ -39,22 +39,41 @@ const provisionTokens = async (req, res) => {
       .select("tokenId status")
       .lean();
 
-    // If we already have a full pool (or more), don't generate more.
-    // Cleanup: If there are MORE than 50 (e.g. 53 in your DB), delete the oldest extras to stay at 50.
-    if (existing.length >= BATCH_SIZE) {
-      if (existing.length > BATCH_SIZE) {
-        const extraCount = existing.length - BATCH_SIZE;
-        // Sort by ID is essentially chronological in many cases, but for safety we just take the first N
-        const toDeleteIds = existing.slice(0, extraCount).map(t => t._id); 
-        await MachineToken.deleteMany({ _id: { $in: toDeleteIds } });
-        console.log(`[HW] Cleaned up ${extraCount} extra tokens for machine ${machineId}`);
-        
-        // Refresh the list for the response
-        const cleaned = await MachineToken.find({ machineId, status: { $in: ["AVAILABLE", "ALLOCATED"] } }).select("tokenId").lean();
-        return res.json({ success: true, machineId, tokenCount: cleaned.length, tokens: cleaned });
-      }
+    // If we already have more than BATCH_SIZE (50), we must prune extras.
+    // BUT we must NEVER delete ALLOCATED tokens (users' active passes).
+    if (existing.length > BATCH_SIZE) {
+      const allocated = existing.filter(t => t.status === "ALLOCATED");
+      const available = existing.filter(t => t.status === "AVAILABLE");
 
-      console.log(`[HW] Machine ${machineId} already has ${existing.length} active tokens`);
+      // Calculate how many AVAILABLE tokens we need to remove to hit 50
+      // Pool = Allocated + Available. If Pool > 50, we remove from Available.
+      const totalActive = allocated.length + available.length;
+      const extraCount = totalActive - BATCH_SIZE;
+
+      if (extraCount > 0 && available.length > 0) {
+        // Delete up to extraCount from the AVAILABLE set (oldest first)
+        const toDeleteIds = available.slice(0, Math.min(extraCount, available.length)).map(t => t._id);
+        await MachineToken.deleteMany({ _id: { $in: toDeleteIds } });
+        console.log(`[HW] Safety Cleanup: Pruned ${toDeleteIds.length} extra AVAILABLE tokens, preserved all ${allocated.length} ALLOCATED tokens.`);
+        
+        // Refresh the list for the final response
+        const refreshed = await MachineToken.find({ 
+          machineId, 
+          status: { $in: ["AVAILABLE", "ALLOCATED"] } 
+        }).select("tokenId").lean();
+        
+        return res.json({
+          success: true,
+          machineId,
+          tokenCount: refreshed.length,
+          tokens: refreshed.map(t => ({ tokenId: t.tokenId })),
+        });
+      }
+    }
+
+    // If exactly 50, just return them
+    if (existing.length === BATCH_SIZE) {
+      console.log(`[HW] Machine ${machineId} has exactly ${existing.length} active tokens. Returning full set.`);
       return res.json({
         success: true,
         machineId,
