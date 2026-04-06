@@ -31,14 +31,30 @@ const provisionTokens = async (req, res) => {
       return res.status(400).json({ success: false, message: "machineId required" });
     }
 
-    // Check existing AVAILABLE tokens
-    const existing = await MachineToken.find({ machineId, status: "AVAILABLE" })
-      .select("tokenId")
+    // Check existing ACTIVE tokens (AVAILABLE for anyone + ALLOCATED but not yet scanned)
+    const existing = await MachineToken.find({ 
+      machineId, 
+      status: { $in: ["AVAILABLE", "ALLOCATED"] } 
+    })
+      .select("tokenId status")
       .lean();
 
-    // If we already have a full pool, don't generate more
+    // If we already have a full pool (or more), don't generate more.
+    // Cleanup: If there are MORE than 50 (e.g. 53 in your DB), delete the oldest extras to stay at 50.
     if (existing.length >= BATCH_SIZE) {
-      console.log(`[HW] Machine ${machineId} already has ${existing.length} available tokens`);
+      if (existing.length > BATCH_SIZE) {
+        const extraCount = existing.length - BATCH_SIZE;
+        // Sort by ID is essentially chronological in many cases, but for safety we just take the first N
+        const toDeleteIds = existing.slice(0, extraCount).map(t => t._id); 
+        await MachineToken.deleteMany({ _id: { $in: toDeleteIds } });
+        console.log(`[HW] Cleaned up ${extraCount} extra tokens for machine ${machineId}`);
+        
+        // Refresh the list for the response
+        const cleaned = await MachineToken.find({ machineId, status: { $in: ["AVAILABLE", "ALLOCATED"] } }).select("tokenId").lean();
+        return res.json({ success: true, machineId, tokenCount: cleaned.length, tokens: cleaned });
+      }
+
+      console.log(`[HW] Machine ${machineId} already has ${existing.length} active tokens`);
       return res.json({
         success: true,
         machineId,
@@ -53,7 +69,7 @@ const provisionTokens = async (req, res) => {
 
     // Top up to exactly BATCH_SIZE (50)
     const needed = BATCH_SIZE - existing.length;
-    const newTokens = await generateAndSaveTokens(machineId, needed, batchIndex);
+    const newTokens = await generateAndSaveTokens(machineId, Math.max(0, needed), batchIndex);
     const allTokens = [...existing.map((t) => ({ tokenId: t.tokenId })), ...newTokens];
 
     console.log(`[HW] Provisioned ${needed} tokens for machine ${machineId} (batch ${batchIndex})`);
@@ -137,15 +153,27 @@ const syncBatch = async (req, res) => {
     });
 
     await Promise.allSettled(logPromises);
-
-    // Generate fresh replacements matching EXACTLY the amount used to maintain the pool of 50
-    const lastToken = await MachineToken.findOne({ machineId }).sort({ batchIndex: -1 }).lean();
-    const batchIndex = lastToken ? lastToken.batchIndex + 1 : 0;
     
-    // We replace exactly the amount used, rather than a hardcoded REFRESH_SIZE, to ensure pool stays at 50
-    const freshTokens = await generateAndSaveTokens(machineId, usedTokens.length, batchIndex);
+    // -----------------------------------------------------------------
+    // SMART REPLENISHMENT
+    // -----------------------------------------------------------------
+    // Instead of blindly adding usedTokens.length, we check the CURRENT total pool
+    // (Available + Allocated) to ensure we hit exactly 50 total.
+    const currentActiveCount = await MachineToken.countDocuments({ 
+        machineId, 
+        status: { $in: ["AVAILABLE", "ALLOCATED"] } 
+    });
 
-    console.log(`[HW] Sync complete for ${machineId}: processed ${usedTokens.length} tokens, issued ${freshTokens.length} fresh`);
+    const neededToMaintainPool = Math.max(0, BATCH_SIZE - currentActiveCount);
+    
+    let freshTokens = [];
+    if (neededToMaintainPool > 0) {
+      const lastToken = await MachineToken.findOne({ machineId }).sort({ batchIndex: -1 }).lean();
+      const batchIndex = lastToken ? lastToken.batchIndex + 1 : 0;
+      freshTokens = await generateAndSaveTokens(machineId, neededToMaintainPool, batchIndex);
+    }
+
+    console.log(`[HW] Sync complete for ${machineId}: Used ${usedTokens.length}, Refilled ${freshTokens.length} to maintain total count of 50.`);
 
     return res.json({
       success: true,
