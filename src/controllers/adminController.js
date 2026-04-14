@@ -2,6 +2,7 @@ const AccessRequest = require("../models/AccessRequest");
 const QRPass = require("../models/QRPass");
 const ScanLog = require("../models/ScanLog");
 const UserActivity = require("../models/UserActivity");
+const FlaggedActivity = require("../models/FlaggedActivity");
 
 const { generateQRToken } = require("../services/qrService");
 const { generateQRImage } = require("../services/qrImageService");
@@ -420,11 +421,11 @@ const getUserContributionCalendar = async (req, res) => {
  */
 const getFlaggedActivities = async (req, res) => {
   try {
-    const flagged = await UserActivity.find({ isFlagged: true })
-      .sort({ date: -1 })
+    const flagged = await FlaggedActivity.find()
+      .sort({ createdAt: -1 })
       .limit(100);
 
-    // Enrich with user details
+    // Enrich with user details from AccessRequest
     const requestIds = [...new Set(flagged.map((f) => f.requestId.toString()))];
     const users = await AccessRequest.find({ _id: { $in: requestIds } });
 

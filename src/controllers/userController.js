@@ -3,6 +3,7 @@ const QRPass = require("../models/QRPass");
 const User = require("../models/User");
 const MachineToken = require("../models/MachineToken");
 const ScanLog = require("../models/ScanLog");
+const UserActivity = require("../models/UserActivity");
 const { getContributionCalendar } = require("../services/activityService");
 const { getActiveQRType, checkRestriction } = require("../services/qrRotationService");
 const { broadcast } = require("../services/notificationService");
@@ -115,6 +116,24 @@ const getUserQRByIdNumber = async (req, res) => {
     const activeQRType = request.currentState === "OUTSIDE" ? "IN" : "OUT";
     const activePass = passes.find((p) => p.passType === activeQRType);
 
+    // ✅ Get flagged status for today
+    // const today = new Date().toISOString().split("T")[0];
+    // const activity = await UserActivity.findOne({
+    //   requestId: request._id,
+    //   date: today,
+    // });
+
+    // ✅ Get restriction status
+    const restrictionCheck = await checkRestriction(request._id.toString());
+    const isCurrentlyRestricted = restrictionCheck.isRestricted;
+
+    // ✅ Get flagged status for today
+    const today = new Date().toISOString().split("T")[0];
+    const activity = await UserActivity.findOne({
+      requestId: request._id,
+      date: today,
+    });
+
     return res.json({
       status: "APPROVED",
       fullName: request.fullName,
@@ -127,6 +146,9 @@ const getUserQRByIdNumber = async (req, res) => {
       activeQR: activePass,
       entryQR: passes.find((p) => p.passType === "IN"),
       exitQR: passes.find((p) => p.passType === "OUT"),
+      isFlagged: activity?.isFlagged || isCurrentlyRestricted || false,
+      flagReason: activity?.flagReason || (isCurrentlyRestricted ? "Access restricted due to suspicious activity." : null),
+      restrictionUntil: restrictionCheck.until,
     });
   } catch (err) {
     console.error("❌ Error getUserQRByIdNumber:", err.message);
@@ -188,12 +210,21 @@ const getActiveQR = async (req, res) => {
     const passes = await QRPass.find({ requestId: request._id });
     const activePass = passes.find((p) => p.passType === rotation.activeQRType);
 
+    // ✅ Get flagged status for today
+    const today = new Date().toISOString().split("T")[0];
+    const activity = await UserActivity.findOne({
+      requestId: request._id,
+      date: today,
+    });
+
     return res.json({
       status: "APPROVED",
       activeQRType: rotation.activeQRType,
       qrToken: activePass?.qrToken,
       rotationTimestamp: rotation.rotationTimestamp,
       currentState: request.currentState,
+      isFlagged: activity?.isFlagged || true, // Since it reached here but could be historically flagged
+      flagReason: activity?.flagReason || "Account flagged for suspicious activity.",
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -231,6 +262,7 @@ const getMyProfile = async (req, res) => {
         validUntil: request ? request.validUntil : null,
         currentState: request ? request.currentState : "OUTSIDE",
         preferredMachineId: userProfile.preferredMachineId,
+        isFlagged: (request && (await UserActivity.findOne({ requestId: request._id, date: new Date().toISOString().split("T")[0] }))?.isFlagged) || false,
       },
     });
   } catch (err) {

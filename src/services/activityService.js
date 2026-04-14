@@ -1,12 +1,16 @@
 const UserActivity = require("../models/UserActivity");
 const ScanLog = require("../models/ScanLog");
+const FlaggedActivity = require("../models/FlaggedActivity");
+const { getFlaggingWindow } = require("./settingsService");
+const { applyRestriction } = require("./qrRotationService");
 
 /**
  * Update user activity after each scan
  */
-const updateUserActivity = async (requestId, passType) => {
+const updateUserActivity = async (requestId, passType, scanTime = null) => {
   try {
-    const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+    const timeToUse = scanTime ? new Date(scanTime) : new Date();
+    const today = timeToUse.toISOString().split("T")[0]; // YYYY-MM-DD
 
     let activity = await UserActivity.findOne({
       requestId,
@@ -23,11 +27,13 @@ const updateUserActivity = async (requestId, passType) => {
 
     // Update check-in/check-out times
     if (passType === "IN") {
-      if (!activity.checkInTime) {
-        activity.checkInTime = new Date();
+      if (!activity.checkInTime || timeToUse < new Date(activity.checkInTime)) {
+        activity.checkInTime = timeToUse;
       }
     } else if (passType === "OUT") {
-      activity.checkOutTime = new Date();
+      if (!activity.checkOutTime || timeToUse > new Date(activity.checkOutTime)) {
+        activity.checkOutTime = timeToUse;
+      }
       
       // Calculate duration if both times exist
       if (activity.checkInTime && activity.checkOutTime) {
@@ -73,35 +79,64 @@ const getContributionCalendar = async (requestId, startDate, endDate) => {
  */
 const checkAbusePattern = async (requestId) => {
   try {
-    const oneMinuteAgo = new Date(Date.now() - 60000);
+    const windowMinutes = await getFlaggingWindow();
+    const windowMs = windowMinutes * 60000;
 
-    const recentScans = await ScanLog.countDocuments({
+    // Fetch the last two successful scans for this user
+    const lastTwoScans = await ScanLog.find({
       requestId,
-      createdAt: {
-        $gte: oneMinuteAgo,
-      },
       result: "ALLOW",
-    });
+    })
+      .sort({ createdAt: -1 })
+      .limit(2);
 
-    // ✅ Flag if more than 1 successful scan in 1 minute (IN then OUT or OUT then IN)
-    if (recentScans > 1) {
-      const today = new Date().toISOString().split("T")[0];
-      
-      const activity = await UserActivity.findOne({
-        requestId,
-        date: today,
-      });
+    if (lastTwoScans.length < 2) {
+      return { isAbuse: false };
+    }
 
-      if (activity) {
-        activity.isFlagged = true;
-        activity.flagReason = `${recentScans} scans within 1 minute - Possible proxy attendance`;
-        await activity.save();
+    const currentScan = lastTwoScans[0];
+    const previousScan = lastTwoScans[1];
+
+    // ✅ FLAG CONDITION: OUT followed by IN within the window
+    if (previousScan.passType === "OUT" && currentScan.passType === "IN") {
+      const timeDiff = new Date(currentScan.createdAt).getTime() - new Date(previousScan.createdAt).getTime();
+
+      if (timeDiff <= windowMs) {
+        const reason = `OUT -> IN scan within ${windowMinutes}m (${Math.round(timeDiff / 1000)}s)`;
+        
+        // 1. Create permanent incident record
+        await FlaggedActivity.create({
+          requestId,
+          reason,
+          scanLogId: currentScan._id,
+          previousScanLogId: previousScan._id,
+        });
+
+        // 2. Ensure flagging is visible on CURRENT date regardless of scan timestamp
+        // (Fixes hardware clock mismatch issues)
+        const realToday = new Date().toISOString().split("T")[0];
+        let todayActivity = await UserActivity.findOne({ requestId, date: realToday });
+        if (!todayActivity) {
+          todayActivity = await UserActivity.create({
+            requestId,
+            date: realToday,
+            scanCount: 0,
+            isFlagged: true,
+            flagReason: reason
+          });
+        } else {
+          todayActivity.isFlagged = true;
+          todayActivity.flagReason = reason;
+          await todayActivity.save();
+        }
+
+        // 3. AUTO-BLOCK
+        await applyRestriction(requestId);
+
+        console.log(`[ABUSE] User ${requestId} flagged and blocked: ${reason}`);
+
+        return { isAbuse: true, reason };
       }
-
-      return {
-        isAbuse: true,
-        scanCount: recentScans,
-      };
     }
 
     return { isAbuse: false };

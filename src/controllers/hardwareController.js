@@ -1,4 +1,8 @@
 const { v4: uuidv4 } = require("uuid");
+const { 
+  updateUserActivity, 
+  checkAbusePattern 
+} = require("../services/activityService");
 const MachineToken = require("../models/MachineToken"); // Ensure this points to your new schema file
 const AccessRequest = require("../models/AccessRequest");
 const ScanLog = require("../models/ScanLog");
@@ -120,16 +124,19 @@ const syncBatch = async (req, res) => {
 
     // Process each used token
     const logPromises = usedTokens.map(async (entry) => {
-      // Hardware can now send an array of objects to explicitly declare the scanned state
+      // 1. Parse hardware-reported data
+      // Hardware can send { tokenId, state, idNumber, timestamp }
       const tokenId = typeof entry === "string" ? entry : entry.tokenId;
-      const scannedState = typeof entry === "object" && entry.state ? entry.state : null;
+      const scannedState = typeof entry === "object" ? entry.state : null;
+      const idNumber = typeof entry === "object" ? entry.idNumber : null;
+      const timestamp = typeof entry === "object" ? entry.timestamp : null;
 
-      // 1. Mark token as USED and record exact backend time (ignore hardware timestamps)
+      // 2. Mark token as USED locally to track its lifecycle
       const token = await MachineToken.findOneAndUpdate(
         { tokenId, machineId },
         { 
           status: "USED", 
-          usedAt: new Date() 
+          usedAt: timestamp ? new Date(parseInt(timestamp)) : new Date() 
         },
         { new: true }
       );
@@ -139,35 +146,49 @@ const syncBatch = async (req, res) => {
         return null;
       }
 
-      // 2. Safely map back to whom it was allocated
-      if (!token.allocatedTo) {
-        console.warn(`[HW] Sync: token ${tokenId} has no allocated user`);
-        return null;
+      // 3. Resolve user identity (Priority: idNumber from batch > token metadata)
+      let user = null;
+      if (idNumber) {
+        user = await AccessRequest.findOne({ idNumber });
+      } 
+      
+      if (!user && token.allocatedTo) {
+        user = await AccessRequest.findById(token.allocatedTo);
       }
 
-      const user = await AccessRequest.findById(token.allocatedTo).lean();
-
-      // 3. Generate correct logs. We prioritize the state the hardware physically scanned.
+      // 4. Generate Audit Log & Update User Location State
       if (user) {
+        // Hardware manages state (IN/OUT). We trust its report.
         const finalPassType = scannedState || token.allocatedState || "IN";
+        console.log(`[HW] Sync Log: Creating log for user ${user.idNumber}, state: ${finalPassType}`);
         
-        // Insert the immutable ledger
-        await ScanLog.create({
-          requestId: user._id,
-          tokenId,
-          passType: finalPassType,
-          gateId: machineId,
-          machineId,
-          result: "ALLOW",
-          reason: `Instant/Batch sync from ${machineId}`,
-          createdAt: new Date(), // Strictly use backend timestamp
-        });
+        try {
+          await ScanLog.create({
+            requestId: user._id,
+            tokenId,
+            passType: finalPassType,
+            gateId: machineId,
+            machineId,
+            result: "ALLOW",
+            reason: "Hardware sync (state-aware)",
+            createdAt: timestamp ? new Date(parseInt(timestamp)) : new Date(), 
+          });
+          console.log(`[HW] Sync Log: Created successfully for ${tokenId}`);
+        } catch (logErr) {
+          console.error(`[HW] Sync Log ERROR: ${logErr.message}`);
+        }
 
-        // 4. Update the user's live database state (INSIDE / OUTSIDE)
-        // This flawlessly triggers the Frontend's 3-second smart polling to succeed!
+        // Atomic update of user's current physical location
         await AccessRequest.findByIdAndUpdate(user._id, {
           currentState: finalPassType === "IN" ? "INSIDE" : "OUTSIDE"
         });
+
+        // ✅ NEW: Update attendance activity and check for abuse patterns
+        const scanTimestamp = timestamp ? new Date(parseInt(timestamp)) : new Date();
+        await updateUserActivity(user._id, finalPassType, scanTimestamp);
+        await checkAbusePattern(user._id);
+      } else {
+        console.warn(`[HW] Sync Log SKIPPED: User not found for token ${tokenId} or idNumber ${idNumber}`);
       }
     });
 
@@ -216,12 +237,12 @@ const validateQR = async (req, res) => {
       return res.status(400).json({ access: false, message: "Missing QR data" });
     }
 
-    // Format expected from frontend QR payload: "<tokenId>|<state>|<idNumber>"
+    // Format expected from frontend QR payload: "<tokenId>|<state>|<idNumber>|<timestamp>"
     const parts = qrData.split("|");
     if (parts.length < 3) {
       return res.status(400).json({ access: false, message: "Invalid QR format" });
     }
-    const [tokenId, state, idNumber] = parts;
+    const [tokenId, state, idNumber, timestamp] = parts;
 
     // Validate token exists and was assigned to a user (ALLOCATED)
     const token = await MachineToken.findOne({ tokenId });
@@ -259,6 +280,7 @@ const validateQR = async (req, res) => {
     }
 
     // --- All checks passed: execute state change ---
+    console.log(`[HW] Online: Validating token ${tokenId} for user ${idNumber}`);
     user.currentState = state === "IN" ? "INSIDE" : "OUTSIDE";
     await user.save();
 
@@ -268,15 +290,21 @@ const validateQR = async (req, res) => {
     await token.save();
 
     // Log the scan
-    await ScanLog.create({
-      requestId: user._id,
-      tokenId,
-      passType: state,
-      gateId: token.machineId || "UNKNOWN",
-      machineId: token.machineId,
-      result: "ALLOW",
-      reason: "Online real-time validation",
-    });
+    try {
+      await ScanLog.create({
+        requestId: user._id,
+        tokenId,
+        passType: state,
+        gateId: token.machineId || "UNKNOWN",
+        machineId: token.machineId,
+        result: "ALLOW",
+        reason: "Online real-time validation",
+        createdAt: timestamp ? new Date(parseInt(timestamp)) : new Date(),
+      });
+      console.log(`[HW] Online Log: Created successfully for ${tokenId}`);
+    } catch (logErr) {
+      console.error(`[HW] Online Log ERROR: ${logErr.message}`);
+    }
 
     return res.json({
       access: true,

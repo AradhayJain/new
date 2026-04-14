@@ -1,6 +1,8 @@
 const {
   getRestrictionDuration,
   updateRestrictionDuration,
+  getFlaggingWindow,
+  updateFlaggingWindow,
   getAllSettings,
 } = require("../services/settingsService");
 
@@ -10,10 +12,12 @@ const {
 const getRestrictionSettings = async (req, res) => {
   try {
     const duration = await getRestrictionDuration();
+    const window = await getFlaggingWindow();
 
     return res.json({
       restrictionDurationMinutes: duration,
-      message: "Current restriction duration retrieved",
+      flaggingWindowMinutes: window,
+      message: "Current restriction settings retrieved",
     });
   } catch (err) {
     return res.status(500).json({
@@ -28,19 +32,25 @@ const getRestrictionSettings = async (req, res) => {
  */
 const updateRestrictionSettings = async (req, res) => {
   try {
-    const { durationMinutes } = req.body;
+    const { durationMinutes, flaggingWindowMinutes } = req.body;
 
-    if (!durationMinutes) {
-      return res.status(400).json({
-        message: "durationMinutes is required",
-      });
+    let restrictionDuration = null;
+    let flaggingWindow = null;
+
+    if (durationMinutes) {
+      const setting = await updateRestrictionDuration(durationMinutes);
+      restrictionDuration = setting.settingValue;
     }
 
-    const setting = await updateRestrictionDuration(durationMinutes);
+    if (flaggingWindowMinutes) {
+      const setting = await updateFlaggingWindow(flaggingWindowMinutes);
+      flaggingWindow = setting.settingValue;
+    }
 
     return res.json({
-      message: "Restriction duration updated successfully",
-      restrictionDurationMinutes: setting.settingValue,
+      message: "Restriction settings updated successfully",
+      restrictionDurationMinutes: restrictionDuration,
+      flaggingWindowMinutes: flaggingWindow,
     });
   } catch (err) {
     return res.status(400).json({
