@@ -23,6 +23,7 @@
     "qrcode": "^1.5.4",
     "react-qr-code": "^2.0.18",
     "redis": "^5.10.0",
+    "serverless-http": "^4.0.0",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
