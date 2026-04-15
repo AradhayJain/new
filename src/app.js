@@ -37,5 +37,9 @@ app.get("/", (req, res) => {
   res.send("✅ FocusDesk Backend Running on Vercel");
 });
 
+app.get("/test", (req, res) => {
+  res.send("Test route working");
+});
+
 // ✅ Export serverless handler (IMPORTANT)
 module.exports = serverless(app);
