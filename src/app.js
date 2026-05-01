@@ -41,5 +41,5 @@ app.get("/test", (req, res) => {
   res.send("Test route working");
 });
 
-// ✅ Export serverless handler (IMPORTANT)
-module.exports = serverless(app);
+// ✅ Export app instance
+module.exports = app;
